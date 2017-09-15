@@ -19,8 +19,10 @@ package org.apache.logging.log4j.core.layout;
 import java.io.IOException;
 import java.io.Writer;
 import java.nio.charset.Charset;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.logging.log4j.core.config.Configuration;
@@ -36,8 +38,7 @@ import org.apache.logging.log4j.util.Strings;
 import com.fasterxml.jackson.annotation.JsonAnyGetter;
 import com.fasterxml.jackson.annotation.JsonRootName;
 import com.fasterxml.jackson.annotation.JsonUnwrapped;
-import com.fasterxml.jackson.core.JsonGenerationException;
-import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.annotation.JsonValue;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.dataformat.xml.annotation.JacksonXmlRootElement;
 
@@ -188,7 +189,9 @@ abstract class AbstractJacksonLayout extends AbstractStringLayout {
     protected final boolean compact;
     protected final boolean complete;
     protected final boolean includeNullDelimiter;
-    protected final ResolvableKeyValuePair[] additionalFields;
+    protected final Map<String, Object> additionalFields;
+
+    private final static ThreadLocal<LogEvent> currentEvent = new ThreadLocal<>();
 
     @Deprecated
     protected AbstractJacksonLayout(final Configuration config, final ObjectWriter objectWriter, final Charset charset,
@@ -221,25 +224,22 @@ abstract class AbstractJacksonLayout extends AbstractStringLayout {
         return value != null && value.contains("${");
     }
 
-    private static ResolvableKeyValuePair[] prepareAdditionalFields(final Configuration config, final KeyValuePair[] additionalFields) {
+    private static Map<String, Object> prepareAdditionalFields(final Configuration config, final KeyValuePair[] additionalFields) {
         if (additionalFields == null || additionalFields.length == 0) {
             // No fields set
-            return new ResolvableKeyValuePair[0];
+            return Collections.emptyMap();
         }
 
-        // Convert to specific class which already determines whether values needs lookup during serialization
-        final ResolvableKeyValuePair[] resolvableFields = new ResolvableKeyValuePair[additionalFields.length];
+        // Note: ResolvableValue uses ThreadLocal pointing to currently processed event, thus its toString is thread-dependent
+        // Therefor we can reuse same object across multiple threads
+        final Map<String, Object> additionalFieldsMap = new LinkedHashMap<>(additionalFields.length);
 
-        for (int i = 0; i < additionalFields.length; i++) {
-            ResolvableKeyValuePair resolvable = resolvableFields[i] = new ResolvableKeyValuePair(additionalFields[i]);
-
-            // Validate
-            if (config == null && resolvable.valueNeedsLookup) {
-                throw new IllegalArgumentException("configuration needs to be set when there are additional fields with variables");
-            }
+        for (KeyValuePair pair : additionalFields) {
+            final String value = pair.getValue();
+            additionalFieldsMap.put(pair.getKey(), valueNeedsLookup(value) ? new ResolvableValue(config, value) : value);
         }
 
-        return resolvableFields;
+        return additionalFieldsMap;
     }
 
     /**
@@ -270,40 +270,21 @@ abstract class AbstractJacksonLayout extends AbstractStringLayout {
                 : event;
     }
 
-    protected Object wrapLogEvent(final LogEvent event) {
-        if (additionalFields.length > 0) {
-            // Construct map for serialization - note that we are intentionally using original LogEvent
-            Map<String, String> additionalFieldsMap = resolveAdditionalFields(event);
-            // This class combines LogEvent with AdditionalFields during serialization
-            return new LogEventWithAdditionalFields(event, additionalFieldsMap);
+    public void toSerializable(LogEvent event, final Writer writer)
+            throws IOException {
+        event = convertMutableToLog4jEvent(event);
+
+        if (additionalFields.isEmpty()) {
+            objectWriter.writeValue(writer, event);
         } else {
-            // No additional fields, return original object
-            return event;
-        }
-    }
-
-    private Map<String, String> resolveAdditionalFields(LogEvent logEvent) {
-        // Note: LinkedHashMap retains order
-        final Map<String, String> additionalFieldsMap = new LinkedHashMap<>(additionalFields.length);
-        final StrSubstitutor strSubstitutor = configuration.getStrSubstitutor();
-
-        // Go over each field
-        for (ResolvableKeyValuePair pair : additionalFields) {
-            if (pair.valueNeedsLookup) {
-                // Resolve value
-                additionalFieldsMap.put(pair.key, strSubstitutor.replace(logEvent, pair.value));
-            } else {
-                // Plain text value
-                additionalFieldsMap.put(pair.key, pair.value);
+            try {
+                currentEvent.set(event);
+                objectWriter.writeValue(writer, new LogEventWithAdditionalFields(event, additionalFields));
+            } finally {
+                currentEvent.remove();
             }
         }
 
-        return additionalFieldsMap;
-    }
-
-    public void toSerializable(final LogEvent event, final Writer writer)
-            throws JsonGenerationException, JsonMappingException, IOException {
-        objectWriter.writeValue(writer, wrapLogEvent(convertMutableToLog4jEvent(event)));
         writer.write(eol);
         if (includeNullDelimiter) {
             writer.write('\0');
@@ -316,9 +297,9 @@ abstract class AbstractJacksonLayout extends AbstractStringLayout {
     public static class LogEventWithAdditionalFields {
 
         private final Object logEvent;
-        private final Map<String, String> additionalFields;
+        private final Map<String, Object> additionalFields;
 
-        public LogEventWithAdditionalFields(Object logEvent, Map<String, String> additionalFields) {
+        public LogEventWithAdditionalFields(Object logEvent, Map<String, Object> additionalFields) {
             this.logEvent = logEvent;
             this.additionalFields = additionalFields;
         }
@@ -330,21 +311,30 @@ abstract class AbstractJacksonLayout extends AbstractStringLayout {
 
         @JsonAnyGetter
         @SuppressWarnings("unused")
-        public Map<String, String> getAdditionalFields() {
+        public Map<String, Object> getAdditionalFields() {
             return additionalFields;
         }
     }
 
-    protected static class ResolvableKeyValuePair {
+    protected static class ResolvableValue {
 
-        final String key;
-        final String value;
-        final boolean valueNeedsLookup;
+        final StrSubstitutor strSubstitutor;
+        final String expression;
 
-        ResolvableKeyValuePair(KeyValuePair pair) {
-            this.key = pair.getKey();
-            this.value = pair.getValue();
-            this.valueNeedsLookup = AbstractJacksonLayout.valueNeedsLookup(this.value);
+        ResolvableValue(Configuration configuration, String expression) {
+            if (configuration == null) {
+                throw new IllegalArgumentException("configuration needs to be set when there are additional fields with variables");
+            }
+
+            this.strSubstitutor = configuration.getStrSubstitutor();
+            this.expression = expression;
+        }
+
+        @Override
+        @JsonValue
+        public String toString() {
+            final LogEvent logEvent = currentEvent.get();
+            return strSubstitutor.replace(logEvent, expression);
         }
     }
 }
